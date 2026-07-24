@@ -1,0 +1,388 @@
+"""Attribute FPL team strength scores to the individual players who drive them.
+
+FPL publishes six numbers per team in ``teams.csv`` -- ``strength_attack_*``,
+``strength_defence_*`` and ``strength_overall_*``.  Those numbers are editorial
+integers set by the FPL team; they are not computed from player data, so they
+cannot be decomposed directly.  What *can* be done is:
+
+1.  Rebuild each score from player-level gameweek data and check how much of the
+    published score that reconstruction explains (``calibrate``).
+2.  Decompose the reconstruction, which is additive over players by
+    construction, and express each player's share back in strength points.
+
+Attacking output (xG, xA) is owned by individuals, so its decomposition is
+exact.  Defensive output is a shared team outcome, so it is split with a ridge
+regularised adjusted plus-minus fitted at fixture level.
+
+Usage::
+
+    python player_contributions.py --season 2024-25
+    python player_contributions.py --season 2024-25 --team Arsenal
+    python player_contributions.py --season 2024-25 --out contributions.csv
+"""
+
+import argparse
+import os
+
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold
+
+# Seasons where FPL supplies expected_* columns in the gameweek data.
+XG_SEASONS = ['2022-23', '2023-24', '2024-25', '2025-26']
+
+# A player has to clear this many minutes before a replacement-level baseline or
+# an APM coefficient is worth reading.
+MIN_MINUTES = 450
+
+# Strength points a squad needs to have generated above league average before
+# splitting that credit between its players says anything.
+MIN_SHARE_BASE = 5.0
+
+NUMERIC_COLS = [
+    'minutes', 'expected_goals', 'expected_assists', 'expected_goals_conceded',
+    'goals_scored',
+]
+
+
+def load_gameweeks(season, data_dir='data'):
+    """Load merged gameweek data for a season with the numeric columns coerced."""
+    path = os.path.join(data_dir, season, 'gws', 'merged_gw.csv')
+    gw = pd.read_csv(path)
+    for col in NUMERIC_COLS:
+        gw[col] = pd.to_numeric(gw.get(col), errors='coerce').fillna(0)
+    return gw
+
+
+def load_team_strength(season, data_dir='data'):
+    """Load teams.csv and average the home/away legs of each strength score."""
+    teams = pd.read_csv(os.path.join(data_dir, season, 'teams.csv'))
+    return pd.DataFrame({
+        'team': teams['name'],
+        'fpl_attack': (teams.strength_attack_home + teams.strength_attack_away) / 2,
+        'fpl_defence': (teams.strength_defence_home + teams.strength_defence_away) / 2,
+        'fpl_overall': (teams.strength_overall_home + teams.strength_overall_away) / 2,
+    })
+
+
+def team_season_rates(gw):
+    """Per-match attacking and defensive rates for every team in a season.
+
+    ``expected_goals_conceded`` is recorded once per on-pitch player, so the
+    eleven readings for a match sum to eleven times the team's conceded xG.
+    """
+    agg = gw.groupby('team').agg(
+        xG=('expected_goals', 'sum'),
+        xA=('expected_assists', 'sum'),
+        xGC=('expected_goals_conceded', 'sum'),
+        goals=('goals_scored', 'sum'),
+        minutes=('minutes', 'sum'),
+    ).reset_index()
+    agg['matches'] = agg.team.map(gw.groupby('team').GW.nunique())
+    agg['xG_per_match'] = agg.xG / agg.matches
+    agg['xGC_per_match'] = agg.xGC / 11 / agg.matches
+    agg['xGD_per_match'] = agg.xG_per_match - agg.xGC_per_match
+    return agg
+
+
+DRIVERS = [('fpl_attack', 'xG_per_match'),
+           ('fpl_defence', 'xGC_per_match'),
+           ('fpl_overall', 'xGD_per_match')]
+
+
+def calibrate(season, seasons=None, data_dir='data'):
+    """Fit published FPL strength scores onto team rates rebuilt from players.
+
+    FPL re-bases the strength ladder between seasons, so the slope is fitted on
+    seasons pooled *after* demeaning both sides within season, and the level is
+    then anchored to the requested season.  The slope converts one unit of the
+    underlying rate -- xG per match, xGC per match -- into FPL strength points,
+    which is what puts a player's share of the rate on the same scale as the
+    published score.
+
+    Returns ``{score: (baseline, slope, within_r2, season_r2, n)}`` where
+    ``baseline`` is the score a team of exactly league-average rate would carry
+    in this season.
+    """
+    seasons = seasons or XG_SEASONS
+    frames = []
+    for name in seasons:
+        rates = team_season_rates(load_gameweeks(name, data_dir))
+        merged = rates.merge(load_team_strength(name, data_dir), on='team')
+        merged['season'] = name
+        frames.append(merged)
+    pooled = pd.concat(frames, ignore_index=True)
+    target = pooled[pooled.season == season]
+
+    fits = {}
+    for score, rate in DRIVERS:
+        # Slope from within-season variation only, so cross-season re-basing of
+        # the ladder cannot leak into it.
+        dx = pooled[rate] - pooled.groupby('season')[rate].transform('mean')
+        dy = pooled[score] - pooled.groupby('season')[score].transform('mean')
+        slope = float(np.dot(dx, dy) / np.dot(dx, dx))
+        within_r2 = float(np.corrcoef(dx, dy)[0, 1] ** 2)
+        season_r2 = float(np.corrcoef(target[rate], target[score])[0, 1] ** 2)
+        baseline = float(target[score].mean() - slope * target[rate].mean())
+        fits[score] = (baseline, slope, within_r2, season_r2, len(pooled))
+    return fits
+
+
+def replacement_levels(players, quantile=0.20):
+    """Positional replacement level for attacking rate, in xGI per 90.
+
+    A player's contribution is measured against what a freely available squad
+    player at the same position produces, not against zero -- otherwise every
+    forward outranks every defender by construction.
+    """
+    regulars = players[players.minutes >= MIN_MINUTES]
+    return regulars.groupby('position').xGI_90.quantile(quantile)
+
+
+def attack_contributions(gw, attack_slope):
+    """Exact additive split of each team's attacking rate across its players.
+
+    xG and xA are individually owned, so a team's xG+xA per match is literally
+    the sum of its players' contributions and no model is needed.  Contribution
+    is reported both as a raw share and net of positional replacement level.
+    """
+    players = gw.groupby(['team', 'name', 'position']).agg(
+        minutes=('minutes', 'sum'),
+        xG=('expected_goals', 'sum'),
+        xA=('expected_assists', 'sum'),
+        goals=('goals_scored', 'sum'),
+    ).reset_index()
+    players = players[players.minutes > 0].copy()
+    players['nineties'] = players.minutes / 90
+    players['xGI'] = players.xG + players.xA
+    players['xGI_90'] = players.xGI / players.nineties
+
+    matches = gw.groupby('team').GW.nunique()
+    players['matches'] = players.team.map(matches)
+
+    replacement = replacement_levels(players)
+    players['replacement_90'] = players.position.map(replacement).fillna(0)
+
+    # Share of the team's own attacking output.
+    team_xGI = players.groupby('team').xGI.transform('sum')
+    players['attack_share_pct'] = 100 * players.xGI / team_xGI
+
+    # Rate above replacement, expressed per team-match then priced in strength
+    # points via the calibration slope.
+    above = (players.xGI_90 - players.replacement_90) * players.nineties
+    players['attack_xg_above_repl'] = above
+    players['attack_points'] = attack_slope * above / players.matches
+    return players.drop(columns=['xGI'])
+
+
+def _fixture_design(gw):
+    """Build the fixture-level design matrix for the adjusted plus-minus fit.
+
+    One row per team per fixture.  The target is the xG that team generated;
+    the regressors are the on-pitch fraction of every player, entered once as an
+    attacking effect for the team in possession and once as a defensive effect
+    for the team facing them.
+    """
+    played = gw[gw.minutes > 0].copy()
+    played['pid'] = played.team + '|' + played['name']
+
+    sides = played.groupby(['fixture', 'team', 'was_home']).agg(
+        xG=('expected_goals', 'sum')).reset_index()
+    paired = sides.merge(sides[['fixture', 'team']].rename(columns={'team': 'opponent'}),
+                         on='fixture')
+    paired = paired[paired.team != paired.opponent].reset_index(drop=True)
+
+    players = sorted(played.pid.unique())
+    index = {pid: i for i, pid in enumerate(players)}
+    n = len(players)
+
+    lineups = played.groupby(['fixture', 'team'])[['pid', 'minutes']].apply(
+        lambda d: list(zip(d.pid, d.minutes)), include_groups=False).to_dict()
+
+    rows, cols, vals = [], [], []
+    for r, (fixture, team, opponent) in enumerate(
+            zip(paired.fixture, paired.team, paired.opponent)):
+        for pid, minutes in lineups.get((fixture, team), []):
+            rows.append(r)
+            cols.append(index[pid])
+            vals.append(min(minutes, 90) / 90)
+        for pid, minutes in lineups.get((fixture, opponent), []):
+            rows.append(r)
+            cols.append(n + index[pid])
+            vals.append(min(minutes, 90) / 90)
+
+    x = sparse.csr_matrix((vals, (rows, cols)), shape=(len(paired), 2 * n))
+    home = paired.was_home.astype(float).to_numpy().reshape(-1, 1)
+    x = sparse.hstack([x, sparse.csr_matrix(home)]).tocsr()
+    return x, paired.xG.to_numpy(), players
+
+
+def _select_alpha(x, y, alphas, seed=0):
+    """Pick the ridge penalty by held-out error on fixtures."""
+    folds = KFold(n_splits=5, shuffle=True, random_state=seed)
+    best, best_error = alphas[0], np.inf
+    for alpha in alphas:
+        errors = []
+        for train, test in folds.split(np.arange(len(y))):
+            model = Ridge(alpha=alpha).fit(x[train], y[train])
+            errors.append(np.mean((y[test] - model.predict(x[test])) ** 2))
+        error = np.mean(errors)
+        if error < best_error:
+            best, best_error = alpha, error
+    return best, best_error
+
+
+def defence_contributions(gw, defence_slope, alphas=None, seed=0):
+    """Split each team's conceded-xG rate across players via ridge APM.
+
+    Every player on the pitch shares the same conceded-xG reading, so the only
+    way to separate teammates is the variation created by rotation, injury and
+    substitution.  Ridge handles the collinearity that leaves behind; players
+    who never rotate stay poorly identified and are shrunk toward the league
+    baseline.  Coefficients are additive: the intercept plus the eleven on-pitch
+    coefficients reconstruct a team's conceded xG for that match.
+    """
+    alphas = alphas or [25, 50, 100, 200, 400, 800]
+    x, y, players = _fixture_design(gw)
+    alpha, cv_error = _select_alpha(x, y, alphas, seed)
+    model = Ridge(alpha=alpha).fit(x, y)
+
+    n = len(players)
+    ratings = pd.DataFrame({
+        'pid': players,
+        'apm_attack_90': model.coef_[:n],
+        'apm_defence_90': model.coef_[n:2 * n],
+    })
+    ratings[['team', 'name']] = ratings.pid.str.split('|', n=1, expand=True)
+
+    minutes = gw[gw.minutes > 0].copy()
+    minutes['pid'] = minutes.team + '|' + minutes['name']
+    ratings['minutes'] = ratings.pid.map(minutes.groupby('pid').minutes.sum())
+    ratings['matches'] = ratings.team.map(gw.groupby('team').GW.nunique())
+
+    # Minutes share of a full team-match, so contributions sum to the team rate.
+    share = ratings.minutes / (ratings.matches * 90)
+    ratings['defence_xgc_per_match'] = ratings.apm_defence_90 * share
+
+    # A lower conceded-xG coefficient is better, so credit is measured against
+    # the league-average on-pitch player.
+    league_average = np.average(ratings.apm_defence_90,
+                                weights=ratings.minutes.clip(lower=1))
+    saved = (league_average - ratings.apm_defence_90) * share
+    ratings['defence_xgc_saved'] = saved
+    ratings['defence_points'] = defence_slope * -saved
+
+    # Share of the defensive credit its own squad generated, so defenders are
+    # ranked against teammates rather than against the attacking scale.  A squad
+    # with almost nobody above league average has no meaningful split to report,
+    # so the share is left blank rather than magnified out of rounding noise.
+    positive = ratings.defence_points.clip(lower=0)
+    squad_total = positive.groupby(ratings.team).transform('sum')
+    ratings['defence_share_pct'] = np.where(
+        squad_total >= MIN_SHARE_BASE, 100 * positive / squad_total, np.nan)
+
+    return ratings.drop(columns=['pid']), {'alpha': alpha, 'cv_mse': cv_error,
+                                           'r2': model.score(x, y),
+                                           'home_effect': model.coef_[-1]}
+
+
+def build_report(season, data_dir='data', calibration=None):
+    """Per-player attacking and defensive contributions for one season."""
+    gw = load_gameweeks(season, data_dir)
+    fits = calibration or calibrate(season, data_dir=data_dir)
+    attack_slope = fits['fpl_attack'][1]
+    defence_slope = fits['fpl_defence'][1]
+
+    attack = attack_contributions(gw, attack_slope)
+    defence, apm_info = defence_contributions(gw, defence_slope)
+
+    report = attack.merge(
+        defence[['team', 'name', 'apm_attack_90', 'apm_defence_90',
+                 'defence_xgc_saved', 'defence_points', 'defence_share_pct']],
+        on=['team', 'name'], how='left')
+    report['defence_points'] = report.defence_points.fillna(0)
+    report['total_points'] = report.attack_points + report.defence_points
+    report['season'] = season
+
+    report = report.sort_values(['team', 'total_points'], ascending=[True, False])
+    return report, fits, apm_info
+
+
+def team_accounting(report, season, fits, data_dir='data'):
+    """Reconcile attributed player points against each team's published score.
+
+    Attributed points are measured above a replacement-level baseline, so the
+    residual is the part of the published score that the squad's floor -- rather
+    than any individual -- accounts for.
+    """
+    published = load_team_strength(season, data_dir)
+    totals = report.groupby('team').agg(
+        attack_attributed=('attack_points', 'sum'),
+        defence_attributed=('defence_points', 'sum')).reset_index()
+    totals = totals.merge(published, on='team', how='left')
+    totals['attack_baseline'] = totals.fpl_attack - totals.attack_attributed
+    totals['defence_baseline'] = totals.fpl_defence - totals.defence_attributed
+    return totals.sort_values('attack_attributed', ascending=False)
+
+
+def print_summary(report, fits, apm_info, season, team=None, top=10, data_dir='data'):
+    """Print the calibration, then the biggest contributors."""
+    labels = {'fpl_attack': ('attack ', 'xG per match '),
+              'fpl_defence': ('defence', 'xGC per match'),
+              'fpl_overall': ('overall', 'xGD per match')}
+
+    print(f'\nSeason {season}')
+    print('\nHow much of the published FPL score the player data rebuilds')
+    print('  score     driver          within-R2  season-R2   points per unit')
+    for score, (_, slope, within_r2, season_r2, n) in fits.items():
+        name, driver = labels[score]
+        print(f'  {name}   {driver}     {within_r2:.2f}       {season_r2:.2f}      {slope:+8.1f}')
+    print(f'  (slope fitted on {n} team-seasons, demeaned within season)')
+
+    print(f"\nDefensive APM: alpha={apm_info['alpha']:g}  in-sample R^2={apm_info['r2']:.3f}  "
+          f"home advantage={apm_info['home_effect']:+.3f} xG")
+
+    accounting = team_accounting(report, season, fits, data_dir)
+    teams = [team] if team else sorted(report.team.unique())
+    for name in teams:
+        squad = report[(report.team == name) & (report.minutes >= MIN_MINUTES)]
+        if squad.empty:
+            continue
+        row = accounting[accounting.team == name]
+        print(f'\n=== {name} ===')
+        if not row.empty:
+            row = row.iloc[0]
+            print(f'  published attack {row.fpl_attack:.0f} = {row.attack_baseline:.0f} '
+                  f'replacement-level baseline + {row.attack_attributed:.0f} attributed to players')
+            print(f'  published defence {row.fpl_defence:.0f} = {row.defence_baseline:.0f} '
+                  f'baseline + {row.defence_attributed:.0f} attributed to players')
+        cols = ['name', 'position', 'minutes', 'xGI_90', 'attack_share_pct',
+                'attack_points', 'defence_share_pct', 'defence_points', 'total_points']
+        print(squad.nlargest(top, 'total_points')[cols].round(2).to_string(index=False))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--season', default='2024-25', help='season to analyse')
+    parser.add_argument('--team', help='restrict the printed summary to one team')
+    parser.add_argument('--data-dir', default='data', help='root of the data directory')
+    parser.add_argument('--top', type=int, default=10, help='players listed per team')
+    parser.add_argument('--out', help='write the full player table to this CSV')
+    args = parser.parse_args()
+
+    if args.season not in XG_SEASONS:
+        parser.error(f'expected data is only available for {", ".join(XG_SEASONS)}')
+
+    report, fits, apm_info = build_report(args.season, args.data_dir)
+    print_summary(report, fits, apm_info, args.season, args.team, args.top, args.data_dir)
+
+    if args.out:
+        report.to_csv(args.out, index=False)
+        print(f'\nWrote {len(report)} player rows to {args.out}')
+
+
+if __name__ == '__main__':
+    main()
