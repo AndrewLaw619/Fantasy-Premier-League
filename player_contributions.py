@@ -59,6 +59,19 @@ def load_gameweeks(season, data_dir='data'):
     return gw
 
 
+def load_web_names(season, gw, data_dir='data'):
+    """Map each player's full name to the short name FPL displays.
+
+    Truncating a full name to its last word mangles the ones that need help most
+    -- "Diogo Teixeira da Silva" and "Gabriel Martinelli Silva" both collapse to
+    "Silva".  ``players_raw.csv`` already carries FPL's own display name.
+    """
+    raw = pd.read_csv(os.path.join(data_dir, season, 'players_raw.csv'))
+    short = raw.set_index('id').web_name
+    element = gw.groupby('name').element.first()
+    return element.map(short).fillna(pd.Series(element.index, index=element.index))
+
+
 def load_team_strength(season, data_dir='data'):
     """Load teams.csv and average the home/away legs of each strength score."""
     teams = pd.read_csv(os.path.join(data_dir, season, 'teams.csv'))
@@ -126,6 +139,25 @@ def _within_season_fit(pooled, driver, score):
     return slope, r2
 
 
+def pooled_team_seasons(seasons=None, data_dir='data'):
+    """Team-season rates joined to the published strength scores, all seasons."""
+    seasons = seasons or XG_SEASONS
+    frames = []
+    for name in seasons:
+        rates = team_season_rates(load_gameweeks(name, data_dir))
+        merged = rates.merge(load_team_strength(name, data_dir), on='team')
+        merged['season'] = name
+        frames.append(merged)
+    return pd.concat(frames, ignore_index=True)
+
+
+def best_blend_weight(pooled, score, kind):
+    """The weight on realised output that best explains a published score."""
+    scored = [(_within_season_fit(pooled, blended_driver(pooled, w, kind), score)[1], w)
+              for w in BLEND_GRID]
+    return max(scored)[1]
+
+
 def calibrate(season, seasons=None, data_dir='data'):
     """Fit published FPL strength scores onto team rates rebuilt from players.
 
@@ -141,20 +173,11 @@ def calibrate(season, seasons=None, data_dir='data'):
 
     Returns ``{score: (baseline, slope, weight, within_r2, season_r2, n)}``.
     """
-    seasons = seasons or XG_SEASONS
-    frames = []
-    for name in seasons:
-        rates = team_season_rates(load_gameweeks(name, data_dir))
-        merged = rates.merge(load_team_strength(name, data_dir), on='team')
-        merged['season'] = name
-        frames.append(merged)
-    pooled = pd.concat(frames, ignore_index=True)
+    pooled = pooled_team_seasons(seasons, data_dir)
 
     fits = {}
     for score, kind in DRIVERS:
-        scored = [(_within_season_fit(pooled, blended_driver(pooled, w, kind), score)[1], w)
-                  for w in BLEND_GRID]
-        _, weight = max(scored)
+        weight = best_blend_weight(pooled, score, kind)
         driver = blended_driver(pooled, weight, kind)
         slope, within_r2 = _within_season_fit(pooled, driver, score)
 
@@ -355,6 +378,7 @@ def build_report(season, data_dir='data', calibration=None):
     # sit on different ladders.
     report['overall_points'] = overall_slope * (report.attack_per_match
                                                 + report.defence_per_match)
+    report['web_name'] = report['name'].map(load_web_names(season, gw, data_dir))
     report['season'] = season
 
     report = report.sort_values(['team', 'overall_points'], ascending=[True, False])

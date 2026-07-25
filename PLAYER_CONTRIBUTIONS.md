@@ -135,3 +135,21 @@ python player_contributions.py --season 2024-25
 python player_contributions.py --season 2024-25 --team Arsenal
 python player_contributions.py --season 2024-25 --out contributions.csv
 ```
+
+## Figures
+
+`contribution_figures.py` renders the six figures in `figures/`:
+
+| Figure | Question it answers |
+| --- | --- |
+| `1-calibration` | how much of each published score the player data rebuilds |
+| `2-blend-weight` | why realised output belongs in the driver at all |
+| `3-finishing-premium` | which players the blend moves, and by how much |
+| `4-concentration` | how reliant each team is on its biggest contributor |
+| `5-by-position` | how attacking and defensive credit divide by position |
+| `6-squad-breakdown` | what one team's published score is made of |
+
+```bash
+python contribution_figures.py --season 2024-25 --outdir figures
+python contribution_figures.py --season 2025-26 --teams Arsenal Liverpool
+```
